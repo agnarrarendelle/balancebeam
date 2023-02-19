@@ -1,41 +1,29 @@
 mod request;
 mod response;
 
-use clap::{Parser};
+use clap::Parser;
 use rand::{Rng, SeedableRng};
+use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
-
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
 #[derive(Parser, Debug)]
 #[command(about = "Fun with load balancing")]
 struct CmdOptions {
-    #[clap(
-        short,
-        long,
-        about = "IP/port to bind to",
-        default_value = "0.0.0.0:1100"
-    )]
+    /// "IP/port to bind to"
+    #[arg(short, long, default_value = "0.0.0.0:1100")]
     bind: String,
-    #[clap(short, long, about = "Upstream host to forward requests to")]
+    /// "Upstream host to forward requests to"
+    #[arg(short, long)]
     upstream: Vec<String>,
-    #[clap(
-        long,
-        about = "Perform active health checks on this interval (in seconds)",
-        default_value = "10"
-    )]
+    /// "Perform active health checks on this interval (in seconds)"
+    #[arg(long, default_value = "10")]
     active_health_check_interval: usize,
-    #[clap(
-    long,
-    about = "Path to send request to for active health checks",
-    default_value = "/"
-    )]
+    /// "Path to send request to for active health checks"
+    #[arg(long, default_value = "/")]
     active_health_check_path: String,
-    #[clap(
-        long,
-        about = "Maximum number of requests to accept per IP per minute (0 = unlimited)",
-        default_value = "0"
-    )]
+    /// "Maximum number of requests to accept per IP per minute (0 = unlimited)"
+    #[arg(long, default_value = "0")]
     max_requests_per_minute: usize,
 }
 
@@ -98,10 +86,18 @@ fn main() {
     }
 }
 
-fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> {
+fn get_random_index<T>(addrs: &Vec<T>) -> usize {
     let mut rng = rand::rngs::StdRng::from_entropy();
-    let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
-    let upstream_ip = &state.upstream_addresses[upstream_idx];
+    let random_index = rng.gen_range(0, addrs.len());
+    random_index
+}
+
+fn get_upstream_addr(addrs: &Vec<String>, index: usize) -> String {
+    let upstream_ip = &addrs[index];
+    upstream_ip.to_string()
+}
+
+fn connect_to_upstream(upstream_ip: &str) -> Result<TcpStream, std::io::Error> {
     TcpStream::connect(upstream_ip).or_else(|err| {
         log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
         Err(err)
@@ -111,7 +107,11 @@ fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> 
 
 fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
-    log::info!("{} <- {}", client_ip, response::format_response_line(&response));
+    log::info!(
+        "{} <- {}",
+        client_ip,
+        response::format_response_line(&response)
+    );
     if let Err(error) = response::write_to_stream(&response, client_conn) {
         log::warn!("Failed to send response to client: {}", error);
         return;
@@ -122,15 +122,29 @@ fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
     log::info!("Connection received from {}", client_ip);
 
-    // Open a connection to a random destination server
-    let mut upstream_conn = match connect_to_upstream(state) {
-        Ok(stream) => stream,
-        Err(_error) => {
+    let mut upstream_addrs = state.upstream_addresses.clone();
+    let mut upstream_conn;
+    loop {
+        let random_index = get_random_index(&upstream_addrs);
+        let random_upstream_addr = get_upstream_addr(&upstream_addrs, random_index);
+        match connect_to_upstream(&random_upstream_addr) {
+            Ok(stream) => {
+                upstream_conn = stream;
+                break;
+            }
+            Err(e) => {
+                upstream_addrs.swap_remove(random_index);
+            }
+        }
+
+        if upstream_addrs.len() == 0 {
+            log::error!("No upstream is available");
             let response = response::make_http_error(http::StatusCode::BAD_GATEWAY);
             send_response(&mut client_conn, &response);
             return;
         }
-    };
+    }
+
     let upstream_ip = client_conn.peer_addr().unwrap().ip().to_string();
 
     // The client may now send us one or more requests. Keep trying to read requests until the
@@ -177,7 +191,11 @@ fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
 
         // Forward the request to the server
         if let Err(error) = request::write_to_stream(&request, &mut upstream_conn) {
-            log::error!("Failed to send request to upstream {}: {}", upstream_ip, error);
+            log::error!(
+                "Failed to send request to upstream {}: {}",
+                upstream_ip,
+                error
+            );
             let response = response::make_http_error(http::StatusCode::BAD_GATEWAY);
             send_response(&mut client_conn, &response);
             return;
