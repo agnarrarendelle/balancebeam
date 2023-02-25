@@ -3,7 +3,6 @@ mod response;
 
 use clap::Parser;
 use rand::{Rng, SeedableRng};
-use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -72,7 +71,7 @@ fn main() {
     log::info!("Listening for requests on {}", options.bind);
 
     // Handle incoming connections
-    let state = ProxyState {
+    let mut state = ProxyState {
         upstream_addresses: options.upstream,
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
@@ -81,7 +80,7 @@ fn main() {
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
             // Handle the connection!
-            handle_connection(stream, &state);
+            handle_connection(stream, &mut state);
         }
     }
 }
@@ -118,26 +117,25 @@ fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>
     }
 }
 
-fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
+fn handle_connection(mut client_conn: TcpStream, state: &mut ProxyState) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
     log::info!("Connection received from {}", client_ip);
 
-    let mut upstream_addrs = state.upstream_addresses.clone();
     let mut upstream_conn;
     loop {
-        let random_index = get_random_index(&upstream_addrs);
-        let random_upstream_addr = get_upstream_addr(&upstream_addrs, random_index);
+        let random_index = get_random_index(&state.upstream_addresses);
+        let random_upstream_addr = get_upstream_addr(&state.upstream_addresses, random_index);
         match connect_to_upstream(&random_upstream_addr) {
             Ok(stream) => {
                 upstream_conn = stream;
                 break;
             }
-            Err(e) => {
-                upstream_addrs.swap_remove(random_index);
+            Err(_) => {
+                state.upstream_addresses.swap_remove(random_index);
             }
         }
 
-        if upstream_addrs.len() == 0 {
+        if state.upstream_addresses.len() == 0 {
             log::error!("No upstream is available");
             let response = response::make_http_error(http::StatusCode::BAD_GATEWAY);
             send_response(&mut client_conn, &response);
