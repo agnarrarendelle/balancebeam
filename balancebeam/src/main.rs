@@ -49,6 +49,8 @@ struct ProxyState {
 
     // Servers that are live
     live_servers: Arc<Mutex<Vec<String>>>,
+
+    live_servers_set: Arc<Mutex<HashSet<String>>>,
 }
 
 fn main() {
@@ -78,13 +80,17 @@ fn main() {
     log::info!("Listening for requests on {}", options.bind);
 
     // Handle incoming connections
-    let live_servers = options.upstream.clone();
+    let live_servers = Arc::new(Mutex::new(options.upstream.clone()));
+    let live_servers_set: Arc<Mutex<HashSet<String>>> =
+        Arc::new(Mutex::new(options.upstream.clone().into_iter().collect()));
+
     let mut state = ProxyState {
         upstream_addresses: Arc::new(Mutex::new(options.upstream)),
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
-        live_servers: Arc::new(Mutex::new(live_servers)),
+        live_servers,
+        live_servers_set
     };
 
     for stream in listener.incoming() {
@@ -144,6 +150,8 @@ fn handle_connection(mut client_conn: TcpStream, state: &mut ProxyState) {
             }
             Err(_) => {
                 let mut live_addresses = state.live_servers.lock().unwrap();
+                let mut live_addresses_set = state.live_servers_set.lock().unwrap();
+                live_addresses_set.remove(&random_upstream_addr);
                 live_addresses.swap_remove(random_index);
 
                 if live_addresses.len() == 0 {
