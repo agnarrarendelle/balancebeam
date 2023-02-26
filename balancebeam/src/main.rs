@@ -42,6 +42,9 @@ struct ProxyState {
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: Vec<String>,
+
+    // Servers that are currently unavailable
+    dead_servers: Vec<String>,
 }
 
 fn main() {
@@ -76,6 +79,7 @@ fn main() {
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
+        dead_servers: vec![],
     };
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
@@ -131,6 +135,9 @@ fn handle_connection(mut client_conn: TcpStream, state: &mut ProxyState) {
                 break;
             }
             Err(_) => {
+                state
+                    .dead_servers
+                    .push(state.upstream_addresses[random_index].clone());
                 state.upstream_addresses.swap_remove(random_index);
             }
         }
