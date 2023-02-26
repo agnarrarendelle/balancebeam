@@ -3,7 +3,11 @@ mod response;
 
 use clap::Parser;
 use rand::{Rng, SeedableRng};
-use std::net::{TcpListener, TcpStream};
+use std::{
+    net::{TcpListener, TcpStream},
+    sync::{Arc, Mutex},
+    thread,
+};
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
 #[derive(Parser, Debug)]
@@ -41,10 +45,10 @@ struct ProxyState {
     #[allow(dead_code)]
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
-    upstream_addresses: Vec<String>,
+    upstream_addresses: Arc<Mutex<Vec<String>>>,
 
-    // Servers that are currently unavailable
-    dead_servers: Vec<String>,
+    // Servers that are live
+    live_servers: Arc<Mutex<Vec<String>>>,
 }
 
 fn main() {
@@ -74,13 +78,15 @@ fn main() {
     log::info!("Listening for requests on {}", options.bind);
 
     // Handle incoming connections
+    let live_servers = options.upstream.clone();
     let mut state = ProxyState {
-        upstream_addresses: options.upstream,
+        upstream_addresses: Arc::new(Mutex::new(options.upstream)),
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
-        dead_servers: vec![],
+        live_servers: Arc::new(Mutex::new(live_servers)),
     };
+
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
             // Handle the connection!
@@ -127,26 +133,26 @@ fn handle_connection(mut client_conn: TcpStream, state: &mut ProxyState) {
 
     let mut upstream_conn;
     loop {
-        let random_index = get_random_index(&state.upstream_addresses);
-        let random_upstream_addr = get_upstream_addr(&state.upstream_addresses, random_index);
+        let mut live_addresses = state.live_servers.lock().unwrap();
+        let random_index = get_random_index(&live_addresses);
+        let random_upstream_addr = get_upstream_addr(&live_addresses, random_index);
+        drop(live_addresses);
         match connect_to_upstream(&random_upstream_addr) {
             Ok(stream) => {
                 upstream_conn = stream;
                 break;
             }
             Err(_) => {
-                state
-                    .dead_servers
-                    .push(state.upstream_addresses[random_index].clone());
-                state.upstream_addresses.swap_remove(random_index);
-            }
-        }
+                let mut live_addresses = state.live_servers.lock().unwrap();
+                live_addresses.swap_remove(random_index);
 
-        if state.upstream_addresses.len() == 0 {
-            log::error!("No upstream is available");
-            let response = response::make_http_error(http::StatusCode::BAD_GATEWAY);
-            send_response(&mut client_conn, &response);
-            return;
+                if live_addresses.len() == 0 {
+                    log::error!("No upstream is available");
+                    let response = response::make_http_error(http::StatusCode::BAD_GATEWAY);
+                    send_response(&mut client_conn, &response);
+                    return;
+                }
+            }
         }
     }
 
