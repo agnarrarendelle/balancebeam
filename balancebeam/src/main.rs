@@ -4,9 +4,10 @@ mod response;
 use clap::Parser;
 use rand::{Rng, SeedableRng};
 use std::{
+    collections::HashSet,
     net::{TcpListener, TcpStream},
     sync::{Arc, Mutex},
-    thread,
+    thread, time::Duration,
 };
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -45,7 +46,7 @@ struct ProxyState {
     #[allow(dead_code)]
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
-    upstream_addresses: Arc<Mutex<Vec<String>>>,
+    upstream_addresses: Vec<String>,
 
     // Servers that are live
     live_servers: Arc<Mutex<Vec<String>>>,
@@ -85,14 +86,78 @@ fn main() {
         Arc::new(Mutex::new(options.upstream.clone().into_iter().collect()));
 
     let mut state = ProxyState {
-        upstream_addresses: Arc::new(Mutex::new(options.upstream)),
+        upstream_addresses: options.upstream,
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
         live_servers,
-        live_servers_set
+        live_servers_set,
     };
+    let active_health_check_path = state.active_health_check_path.clone();
+    let upstream_addresses = state.upstream_addresses.clone();
 
+    let live_servers = state.live_servers.clone();
+    let live_servers_set = state.live_servers_set.clone();
+    let sleep_time = state.active_health_check_interval;
+
+    thread::spawn(move || {
+        let active_health_check_path = active_health_check_path;
+        
+        loop {
+            thread::sleep(Duration::from_secs(sleep_time as u64));
+
+            let mut live_servers = live_servers.lock().unwrap();
+            live_servers.clear();
+            // let mut live_servers_set = live_servers_set.lock().unwrap();
+
+            
+            for addr in &upstream_addresses {
+                let request = http::Request::builder()
+                    .method(http::Method::GET)
+                    .uri(&active_health_check_path)
+                    .header("Host", addr)
+                    .body(vec![])
+                    .unwrap();
+
+                match TcpStream::connect(addr) {
+                    Err(e) => {
+                        print!("Failed to connect to server at {addr} because {e}");
+                        continue;
+                    }
+                    Ok(mut stream) => {
+                        if let Err(e) = request::write_to_stream(&request, &mut stream) {
+                            println!("Faild to send content to server at {addr} because {e}");
+                            continue;
+                        }
+
+                        let response = match response::read_from_stream(
+                            &mut stream,
+                            request.method(),
+                        ) {
+                            Ok(response) => response,
+                            Err(e) => {
+                                log::error!(
+                                    "Failed to read response from server at {addr} because {:?}",
+                                    e
+                                );
+                                continue;
+                            }
+                        };
+
+                        match response.status().as_u16() {
+                            200 => {
+                                live_servers.push(addr.clone());
+                            }
+                            _ => {
+                                log::error!("server at {addr} has some problem");
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
             // Handle the connection!
@@ -139,10 +204,13 @@ fn handle_connection(mut client_conn: TcpStream, state: &mut ProxyState) {
 
     let mut upstream_conn;
     loop {
-        let mut live_addresses = state.live_servers.lock().unwrap();
+        let live_addresses = state.live_servers.lock().unwrap();
+        let mut live_addresses_set = state.live_servers_set.lock().unwrap();
+
         let random_index = get_random_index(&live_addresses);
         let random_upstream_addr = get_upstream_addr(&live_addresses, random_index);
         drop(live_addresses);
+        drop(live_addresses_set);
         match connect_to_upstream(&random_upstream_addr) {
             Ok(stream) => {
                 upstream_conn = stream;
