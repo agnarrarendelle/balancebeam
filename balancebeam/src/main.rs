@@ -51,7 +51,6 @@ struct ProxyState {
     // Servers that are live
     live_servers: Arc<Mutex<Vec<String>>>,
 
-    live_servers_set: Arc<Mutex<HashSet<String>>>,
 }
 
 fn main() {
@@ -82,8 +81,6 @@ fn main() {
 
     // Handle incoming connections
     let live_servers = Arc::new(Mutex::new(options.upstream.clone()));
-    let live_servers_set: Arc<Mutex<HashSet<String>>> =
-        Arc::new(Mutex::new(options.upstream.clone().into_iter().collect()));
 
     let mut state = ProxyState {
         upstream_addresses: options.upstream,
@@ -91,13 +88,11 @@ fn main() {
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
         live_servers,
-        live_servers_set,
     };
     let active_health_check_path = state.active_health_check_path.clone();
     let upstream_addresses = state.upstream_addresses.clone();
 
     let live_servers = state.live_servers.clone();
-    let live_servers_set = state.live_servers_set.clone();
     let sleep_time = state.active_health_check_interval;
 
     thread::spawn(move || {
@@ -122,12 +117,12 @@ fn main() {
                 match TcpStream::connect(addr) {
                     Err(e) => {
                         print!("Failed to connect to server at {addr} because {e}");
-                        continue;
+                        return;
                     }
                     Ok(mut stream) => {
                         if let Err(e) = request::write_to_stream(&request, &mut stream) {
                             println!("Faild to send content to server at {addr} because {e}");
-                            continue;
+                            return;
                         }
 
                         let response = match response::read_from_stream(
@@ -140,7 +135,7 @@ fn main() {
                                     "Failed to read response from server at {addr} because {:?}",
                                     e
                                 );
-                                continue;
+                                return;
                             }
                         };
 
@@ -150,7 +145,8 @@ fn main() {
                             }
                             _ => {
                                 log::error!("server at {addr} has some problem");
-                                continue;
+                               
+                                return;
                             }
                         }
                     }
@@ -205,12 +201,10 @@ fn handle_connection(mut client_conn: TcpStream, state: &mut ProxyState) {
     let mut upstream_conn;
     loop {
         let live_addresses = state.live_servers.lock().unwrap();
-        let mut live_addresses_set = state.live_servers_set.lock().unwrap();
 
         let random_index = get_random_index(&live_addresses);
         let random_upstream_addr = get_upstream_addr(&live_addresses, random_index);
         drop(live_addresses);
-        drop(live_addresses_set);
         match connect_to_upstream(&random_upstream_addr) {
             Ok(stream) => {
                 upstream_conn = stream;
@@ -218,8 +212,6 @@ fn handle_connection(mut client_conn: TcpStream, state: &mut ProxyState) {
             }
             Err(_) => {
                 let mut live_addresses = state.live_servers.lock().unwrap();
-                let mut live_addresses_set = state.live_servers_set.lock().unwrap();
-                live_addresses_set.remove(&random_upstream_addr);
                 live_addresses.swap_remove(random_index);
 
                 if live_addresses.len() == 0 {
