@@ -7,7 +7,8 @@ use std::{
     collections::HashSet,
     net::{TcpListener, TcpStream},
     sync::{Arc, Mutex},
-    thread, time::Duration,
+    thread,
+    time::Duration,
 };
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -35,6 +36,7 @@ struct CmdOptions {
 /// to, what servers have failed, rate limiting counts, etc.)
 ///
 /// You should add fields to this struct in later milestones.
+#[derive(Clone)]
 struct ProxyState {
     /// How frequently we check whether upstream servers are alive (Milestone 4)
     #[allow(dead_code)]
@@ -50,7 +52,6 @@ struct ProxyState {
 
     // Servers that are live
     live_servers: Arc<Mutex<Vec<String>>>,
-
 }
 
 fn main() {
@@ -89,75 +90,70 @@ fn main() {
         max_requests_per_minute: options.max_requests_per_minute,
         live_servers,
     };
-    let active_health_check_path = state.active_health_check_path.clone();
-    let upstream_addresses = state.upstream_addresses.clone();
 
-    let live_servers = state.live_servers.clone();
-    let sleep_time = state.active_health_check_interval;
-
-    thread::spawn(move || {
-        let active_health_check_path = active_health_check_path;
-        
-        loop {
-            thread::sleep(Duration::from_secs(sleep_time as u64));
-
-            let mut live_servers = live_servers.lock().unwrap();
-            live_servers.clear();
-            // let mut live_servers_set = live_servers_set.lock().unwrap();
-
-            
-            for addr in &upstream_addresses {
-                let request = http::Request::builder()
-                    .method(http::Method::GET)
-                    .uri(&active_health_check_path)
-                    .header("Host", addr)
-                    .body(vec![])
-                    .unwrap();
-
-                match TcpStream::connect(addr) {
-                    Err(e) => {
-                        print!("Failed to connect to server at {addr} because {e}");
-                        continue;
-                    }
-                    Ok(mut stream) => {
-                        if let Err(e) = request::write_to_stream(&request, &mut stream) {
-                            println!("Faild to send content to server at {addr} because {e}");
-                            continue;
-                        }
-
-                        let response = match response::read_from_stream(
-                            &mut stream,
-                            request.method(),
-                        ) {
-                            Ok(response) => response,
-                            Err(e) => {
-                                log::error!(
-                                    "Failed to read response from server at {addr} because {:?}",
-                                    e
-                                );
-                                continue;
-                            }
-                        };
-
-                        match response.status().as_u16() {
-                            200 => {
-                                live_servers.push(addr.clone());
-                            }
-                            _ => {
-                                log::error!("server at {addr} has some problem");
-                               
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
+    let cloned_state = state.clone();
+    thread::spawn(move || active_health_check(cloned_state));
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
             // Handle the connection!
             handle_connection(stream, &mut state);
+        }
+    }
+}
+
+fn active_health_check(state: ProxyState) {
+    let active_health_check_path = state.active_health_check_path.clone();
+
+    loop {
+        thread::sleep(Duration::from_secs(
+            state.active_health_check_interval as u64,
+        ));
+
+        let mut live_servers = state.live_servers.lock().unwrap();
+        live_servers.clear();
+
+        for addr in &state.upstream_addresses {
+            let request = http::Request::builder()
+                .method(http::Method::GET)
+                .uri(&active_health_check_path)
+                .header("Host", addr)
+                .body(vec![])
+                .unwrap();
+
+            match TcpStream::connect(addr) {
+                Err(e) => {
+                    print!("Failed to connect to server at {addr} because {e}");
+                    continue;
+                }
+                Ok(mut stream) => {
+                    if let Err(e) = request::write_to_stream(&request, &mut stream) {
+                        println!("Faild to send content to server at {addr} because {e}");
+                        continue;
+                    }
+
+                    let response = match response::read_from_stream(&mut stream, request.method()) {
+                        Ok(response) => response,
+                        Err(e) => {
+                            log::error!(
+                                "Failed to read response from server at {addr} because {:?}",
+                                e
+                            );
+                            continue;
+                        }
+                    };
+
+                    match response.status().as_u16() {
+                        200 => {
+                            live_servers.push(addr.clone());
+                        }
+                        _ => {
+                            log::error!("server at {addr} has some problem");
+
+                            continue;
+                        }
+                    }
+                }
+            }
         }
     }
 }
