@@ -117,12 +117,12 @@ fn main() {
                 match TcpStream::connect(addr) {
                     Err(e) => {
                         print!("Failed to connect to server at {addr} because {e}");
-                        return;
+                        continue;
                     }
                     Ok(mut stream) => {
                         if let Err(e) = request::write_to_stream(&request, &mut stream) {
                             println!("Faild to send content to server at {addr} because {e}");
-                            return;
+                            continue;
                         }
 
                         let response = match response::read_from_stream(
@@ -135,7 +135,7 @@ fn main() {
                                     "Failed to read response from server at {addr} because {:?}",
                                     e
                                 );
-                                return;
+                                continue;
                             }
                         };
 
@@ -146,7 +146,7 @@ fn main() {
                             _ => {
                                 log::error!("server at {addr} has some problem");
                                
-                                return;
+                                continue;
                             }
                         }
                     }
