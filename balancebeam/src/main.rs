@@ -4,8 +4,8 @@ mod response;
 use clap::Parser;
 use rand::{Rng, SeedableRng};
 use std::{
-    collections::HashSet,
-    net::{TcpListener, TcpStream},
+    collections::{HashMap},
+    net::{IpAddr, TcpListener, TcpStream},
     sync::{Arc, Mutex},
     thread,
     time::Duration,
@@ -52,6 +52,8 @@ struct ProxyState {
 
     // Servers that are live
     live_servers: Arc<Mutex<Vec<String>>>,
+
+    rate_limiting_counters: Arc<Mutex<HashMap<IpAddr, usize>>>,
 }
 
 fn main() {
@@ -89,12 +91,31 @@ fn main() {
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
         live_servers,
+        rate_limiting_counters: Arc::new(Mutex::new(HashMap::new())),
     };
+
+    if state.max_requests_per_minute > 0 {
+        let counters = state.rate_limiting_counters.clone();
+        thread::spawn(move || refresh_rate_limiting_counter(counters, 60));
+    }
 
     let cloned_state = state.clone();
     thread::spawn(move || active_health_check(cloned_state));
     for stream in listener.incoming() {
-        if let Ok(stream) = stream {
+        if let Ok(mut stream) = stream {
+            if state.max_requests_per_minute > 0 {
+                let mut counters = state.rate_limiting_counters.lock().unwrap();
+                let ip_addr = stream.peer_addr().unwrap().ip();
+                let counter = counters.entry(ip_addr).or_insert(0);
+                *counter += 1;
+
+                if *counter > state.max_requests_per_minute {
+                    let res = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
+                    response::write_to_stream(&res, &mut stream).unwrap();
+                    continue;
+                }
+            }
+
             // Handle the connection!
             handle_connection(stream, &mut state);
         }
@@ -156,6 +177,12 @@ fn active_health_check(state: ProxyState) {
             }
         }
     }
+}
+
+fn refresh_rate_limiting_counter(counters: Arc<Mutex<HashMap<IpAddr, usize>>>, interval: u64) {
+    thread::sleep(Duration::from_secs(interval));
+    let mut counters = counters.lock().unwrap();
+    counters.clear();
 }
 
 fn get_random_index<T>(addrs: &Vec<T>) -> usize {
