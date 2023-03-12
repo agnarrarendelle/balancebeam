@@ -209,7 +209,6 @@ async fn connect_to_upstream(upstream_ip: &str) -> Result<TcpStream, std::io::Er
         log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
         Err(err)
     })
-    // TODO: implement failover (milestone 3)
 }
 
 async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>) {
