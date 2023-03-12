@@ -2,9 +2,10 @@ mod request;
 mod response;
 
 use clap::Parser;
+use std::sync::RwLock;
 use rand::{Rng, SeedableRng};
 use std::{
-    collections::{HashMap},
+    collections::HashMap,
     net::{IpAddr, TcpListener, TcpStream},
     sync::{Arc, Mutex},
     thread,
@@ -51,7 +52,7 @@ struct ProxyState {
     upstream_addresses: Vec<String>,
 
     // Servers that are live
-    live_servers: Arc<Mutex<Vec<String>>>,
+    live_servers: Arc<RwLock<Vec<String>>>,
 
     rate_limiting_counters: Arc<Mutex<HashMap<IpAddr, usize>>>,
 }
@@ -83,7 +84,7 @@ fn main() {
     log::info!("Listening for requests on {}", options.bind);
 
     // Handle incoming connections
-    let live_servers = Arc::new(Mutex::new(options.upstream.clone()));
+    let live_servers = Arc::new(RwLock::new(options.upstream.clone()));
 
     let mut state = ProxyState {
         upstream_addresses: options.upstream,
@@ -101,6 +102,7 @@ fn main() {
 
     let cloned_state = state.clone();
     thread::spawn(move || active_health_check(cloned_state));
+
     for stream in listener.incoming() {
         if let Ok(mut stream) = stream {
             if state.max_requests_per_minute > 0 {
@@ -117,7 +119,8 @@ fn main() {
             }
 
             // Handle the connection!
-            handle_connection(stream, &mut state);
+            let mut state = state.clone();
+            thread::spawn(move || handle_connection(stream, &mut state));
         }
     }
 }
@@ -130,7 +133,7 @@ fn active_health_check(state: ProxyState) {
             state.active_health_check_interval as u64,
         ));
 
-        let mut live_servers = state.live_servers.lock().unwrap();
+        let mut live_servers = state.live_servers.write().unwrap();
         live_servers.clear();
 
         for addr in &state.upstream_addresses {
@@ -223,7 +226,7 @@ fn handle_connection(mut client_conn: TcpStream, state: &mut ProxyState) {
 
     let mut upstream_conn;
     loop {
-        let live_addresses = state.live_servers.lock().unwrap();
+        let live_addresses = state.live_servers.read().unwrap();
 
         let random_index = get_random_index(&live_addresses);
         let random_upstream_addr = get_upstream_addr(&live_addresses, random_index);
@@ -234,7 +237,7 @@ fn handle_connection(mut client_conn: TcpStream, state: &mut ProxyState) {
                 break;
             }
             Err(_) => {
-                let mut live_addresses = state.live_servers.lock().unwrap();
+                let mut live_addresses = state.live_servers.write().unwrap();
                 live_addresses.swap_remove(random_index);
 
                 if live_addresses.len() == 0 {
